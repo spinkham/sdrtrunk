@@ -116,7 +116,7 @@ public class ISCHDecoder
 
                 for(long validCodeword: CODEWORD_MAP_TS1.keySet())
                 {
-                    long mask = codeword & validCodeword;
+                    long mask = codeword ^ validCodeword;
                     int errorCount = Long.bitCount(mask);
 
                     if(errorCount < smallestErrorCount)
@@ -147,7 +147,7 @@ public class ISCHDecoder
 
                 for(long validCodeword: CODEWORD_MAP_TS2.keySet())
                 {
-                    long mask = codeword & validCodeword;
+                    long mask = codeword ^ validCodeword;
                     int errorCount = Long.bitCount(mask);
 
                     if(errorCount < smallestErrorCount)
