@@ -81,6 +81,9 @@ public class AirspyTunerController extends TunerController
     //libairspy submits its USB transfers without a timeout, so a device that stops sending samples never reports an
     //error.  Sample buffers normally arrive every 7 to 26 milliseconds, depending on the sample rate.
     private static final long STREAM_SILENCE_SECONDS = 3;
+    //A stopped stream is restarted, unless it keeps stopping.
+    private static final int STREAM_RESTART_LIMIT = 3;
+    private static final long STREAM_RESTART_RESET_SECONDS = 60;
     private final int mBus;
     private final String mPortAddress;
     private AirspyDevice mDevice;
@@ -93,6 +96,8 @@ public class AirspyTunerController extends TunerController
     private final AtomicLong mDroppedSamples = new AtomicLong();
     private volatile long mLastBufferNanos;
     private long mLastStreamCheckNanos;
+    private long mLastStreamRestartNanos;
+    private int mStreamRestarts;
 
     /**
      * Constructs an instance
@@ -320,6 +325,7 @@ public class AirspyTunerController extends TunerController
                 mDroppedSamples.set(0);
                 mLastBufferNanos = System.nanoTime();
                 mLastStreamCheckNanos = mLastBufferNanos;
+                mStreamRestarts = 0;
                 mStreamCheck = ThreadPool.SCHEDULED.scheduleAtFixedRate(this::checkStream, STREAM_CHECK_INTERVAL_SECONDS,
                         STREAM_CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
             }
@@ -353,9 +359,10 @@ public class AirspyTunerController extends TunerController
     }
 
     /**
-     * Detects a stream that ended by itself and flags the tuner.  libairspy ends the stream when a USB transfer fails
-     * or is incomplete and doesn't restart it, and it can't detect a device that simply stops sending samples.  An
-     * unplugged device is handled separately, by the tuner manager.
+     * Detects a stream that ended by itself and restarts it, or flags the tuner when it keeps ending or can't be
+     * restarted.  libairspy ends the stream when a USB transfer fails or is incomplete and doesn't restart it, and it
+     * can't detect a device that simply stops sending samples.  An unplugged device is handled separately, by the
+     * tuner manager.
      */
     private void checkStream()
     {
@@ -387,15 +394,37 @@ public class AirspyTunerController extends TunerController
                     message = "Airspy sample stream stalled - no samples for " + STREAM_SILENCE_SECONDS + " seconds";
                 }
 
-                if(message != null)
+                if(message == null)
                 {
+                    if(mStreamRestarts > 0 &&
+                        now - mLastStreamRestartNanos > TimeUnit.SECONDS.toNanos(STREAM_RESTART_RESET_SECONDS))
+                    {
+                        mStreamRestarts = 0;
+                    }
+                }
+                else if(mStreamRestarts < STREAM_RESTART_LIMIT)
+                {
+                    mStreamRestarts++;
+                    mLastStreamRestartNanos = now;
+                    mLog.warn(message + " - restarting the stream, attempt " + mStreamRestarts + " of " +
+                            STREAM_RESTART_LIMIT);
+                    //The library keeps the tuner settings, and joins the previous stream's threads on stop.
+                    mDevice.stopRx();
+                    mDevice.startRx(this::receive);
+                    mLastBufferNanos = System.nanoTime();
+                    message = null;
+                }
+                else
+                {
+                    message += " - again after " + STREAM_RESTART_LIMIT + " restarts";
                     clearStream();
                 }
             }
         }
         catch(AirspyException | RuntimeException e)
         {
-            message = "Airspy sample stream check failed - " + e.getMessage();
+            message = (message != null ? message + " - restart failed - " : "Airspy sample stream check failed - ") +
+                    e.getMessage();
             clearStream();
         }
         finally
