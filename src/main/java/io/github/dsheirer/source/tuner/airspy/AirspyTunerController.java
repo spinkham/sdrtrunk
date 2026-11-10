@@ -33,10 +33,14 @@ import io.github.dsheirer.source.tuner.TunerController;
 import io.github.dsheirer.source.tuner.TunerType;
 import io.github.dsheirer.source.tuner.configuration.TunerConfiguration;
 import io.github.dsheirer.source.tuner.manager.UsbDeviceLookup;
+import io.github.dsheirer.util.ThreadPool;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -73,6 +77,10 @@ public class AirspyTunerController extends TunerController
     //Complex samples from libairspy are half the amplitude (-6 dB) of the analytic signal for a real input.  Restoring
     //this keeps spectrum levels and squelch thresholds consistent with the previous Java sample converter.
     private static final float SAMPLE_SCALE = 2.0f;
+    private static final long STREAM_CHECK_INTERVAL_SECONDS = 1;
+    //libairspy submits its USB transfers without a timeout, so a device that stops sending samples never reports an
+    //error.  Sample buffers normally arrive every 7 to 26 milliseconds, depending on the sample rate.
+    private static final long STREAM_SILENCE_SECONDS = 3;
     private final int mBus;
     private final String mPortAddress;
     private AirspyDevice mDevice;
@@ -81,6 +89,10 @@ public class AirspyTunerController extends TunerController
     private int mSampleRate = 0;
     private volatile float mSamplesPerMillisecond = 0.0f;
     private boolean mStreaming = false;
+    private ScheduledFuture<?> mStreamCheck;
+    private final AtomicLong mDroppedSamples = new AtomicLong();
+    private volatile long mLastBufferNanos;
+    private long mLastStreamCheckNanos;
 
     /**
      * Constructs an instance
@@ -165,7 +177,7 @@ public class AirspyTunerController extends TunerController
         {
             device = mDevice;
             mDevice = null;
-            mStreaming = false;
+            clearStream();
         }
         finally
         {
@@ -269,6 +281,13 @@ public class AirspyTunerController extends TunerController
     {
         try
         {
+            mLastBufferNanos = System.nanoTime();
+
+            if(buffer.droppedSamples() > 0)
+            {
+                mDroppedSamples.addAndGet(buffer.droppedSamples());
+            }
+
             float[] samples = buffer.copyFloats();
 
             for(int x = 0; x < samples.length; x++)
@@ -295,6 +314,15 @@ public class AirspyTunerController extends TunerController
         {
             execute(device -> device.startRx(this::receive));
             mStreaming = mDevice != null;
+
+            if(mStreaming)
+            {
+                mDroppedSamples.set(0);
+                mLastBufferNanos = System.nanoTime();
+                mLastStreamCheckNanos = mLastBufferNanos;
+                mStreamCheck = ThreadPool.SCHEDULED.scheduleAtFixedRate(this::checkStream, STREAM_CHECK_INTERVAL_SECONDS,
+                        STREAM_CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
+            }
         }
     }
 
@@ -305,8 +333,90 @@ public class AirspyTunerController extends TunerController
     {
         if(mStreaming)
         {
-            mStreaming = false;
+            clearStream();
             execute(AirspyDevice::stopRx);
+        }
+    }
+
+    /**
+     * Clears the streaming state so that the stream is no longer monitored.  The caller is responsible for stopping it.
+     */
+    private void clearStream()
+    {
+        if(mStreamCheck != null)
+        {
+            mStreamCheck.cancel(false);
+            mStreamCheck = null;
+        }
+
+        mStreaming = false;
+    }
+
+    /**
+     * Detects a stream that ended by itself and flags the tuner.  libairspy ends the stream when a USB transfer fails
+     * or is incomplete and doesn't restart it, and it can't detect a device that simply stops sending samples.  An
+     * unplugged device is handled separately, by the tuner manager.
+     */
+    private void checkStream()
+    {
+        String message = null;
+
+        getLock().lock();
+
+        try
+        {
+            if(mStreaming && mDevice != null)
+            {
+                long now = System.nanoTime();
+
+                //A late check means that the application was paused, and the samples were paused with it.
+                if(now - mLastStreamCheckNanos > TimeUnit.SECONDS.toNanos(2 * STREAM_CHECK_INTERVAL_SECONDS))
+                {
+                    mLastBufferNanos = now;
+                }
+
+                mLastStreamCheckNanos = now;
+
+                if(!mDevice.isStreaming())
+                {
+                    Throwable failure = mDevice.streamingFailure();
+                    message = "Airspy sample stream stopped - " + (failure != null ? failure : "USB transfer error");
+                }
+                else if(now - mLastBufferNanos > TimeUnit.SECONDS.toNanos(STREAM_SILENCE_SECONDS))
+                {
+                    message = "Airspy sample stream stalled - no samples for " + STREAM_SILENCE_SECONDS + " seconds";
+                }
+
+                if(message != null)
+                {
+                    clearStream();
+                }
+            }
+        }
+        catch(AirspyException | RuntimeException e)
+        {
+            message = "Airspy sample stream check failed - " + e.getMessage();
+            clearStream();
+        }
+        finally
+        {
+            getLock().unlock();
+        }
+
+        long dropped = mDroppedSamples.getAndSet(0);
+        float samplesPerMillisecond = mSamplesPerMillisecond;
+
+        if(dropped > 0 && samplesPerMillisecond > 0)
+        {
+            mLog.warn("Airspy dropped [" + dropped + "] samples (" + Math.round(dropped / samplesPerMillisecond) +
+                    " ms) - the computer isn't keeping up with the sample rate");
+        }
+
+        //Outside of the lock because this stops the tuner
+        if(message != null)
+        {
+            mLog.error(message);
+            setErrorMessage(message);
         }
     }
 
